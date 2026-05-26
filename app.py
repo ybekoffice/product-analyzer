@@ -59,6 +59,7 @@ PROMPT_FILE_ON = (
     "배경/부가 제품 무시, 주요 제품 집중.\n\n"
     "웹 섹션(dev_intent·reviews·brand_story) 규칙:\n"
     "- 웹 검색으로 실제 확인된 내용만 포함. 각 항목에 실제 출처 URL 필수.\n"
+    "- source 필드는 반드시 실제 웹사이트 URL 사용 (예: https://naver.com/..., https://taobao.com/...). vertexaisearch.cloud.google.com 등 Google 내부 URL 절대 사용 금지.\n"
     "- 출처 확인 불가 시 그 항목 완전 제외. 추측·일반론 금지.\n"
     "content_proposals는 소구점·스토리 활용 영상 방향 3가지 (출처 불필요).\n\n"
     + _KO_RULES
@@ -81,7 +82,7 @@ PROMPT_TEXT_ON = (
     "특정 제품을 설명하면 → 분석 + 웹 검색 후 아래 JSON 출력.\n"
     "아니면 → 텍스트로 2~3문장 친근하게 응대.\n\n"
     "JSON 출력 시: 마크다운 펜스 없이.\n"
-    "웹 섹션: 확인된 내용 + source URL 필수. 확인 불가 시 항목 제외. content_proposals 3가지.\n\n"
+    "웹 섹션: 확인된 내용 + source URL 필수. source는 실제 웹사이트 URL만 (vertexaisearch.cloud.google.com 등 Google 내부 URL 금지). 확인 불가 시 항목 제외. content_proposals 3가지.\n\n"
     + _KO_RULES
     + _JSON_SHAPE
 )
@@ -180,11 +181,15 @@ def validate_web_items(items):
     for item in (items or []):
         if not isinstance(item, dict):
             continue
-        src = item.get('source', '')
-        if isinstance(src, str) and src.startswith('http'):
-            if not any(d in src for d in _BLOCKED_DOMAINS):
-                result.append(item)
+        if item.get('text'):
+            result.append(item)
     return result
+
+
+def _is_linkable(url):
+    if not (isinstance(url, str) and url.startswith('http')):
+        return False
+    return not any(d in url for d in _BLOCKED_DOMAINS)
 
 
 def domain_label(url):
@@ -249,9 +254,8 @@ def _web_items_html(items, use_search):
         text = item.get('text', '')
         src = item.get('source', '')
         chip = ''
-        if use_search and src and src.startswith('http'):
-            lbl = domain_label(src)
-            chip = f' <a href="{src}" target="_blank" class="source-chip">{lbl} ↗</a>'
+        if use_search and _is_linkable(src):
+            chip = f' <a href="{src}" target="_blank" class="source-chip">{domain_label(src)} ↗</a>'
         lines.append(f'<li>{text}{chip}</li>')
     return '\n'.join(lines)
 
@@ -404,7 +408,7 @@ def render_chat():
                             col.image(img, use_container_width=True)
                 st.markdown(msg['content'])
 
-        use_search = st.toggle('🌐 웹에서 후기·스토리까지 검색 (추가 과금)', key='web_search', value=False)
+        use_search = st.toggle('🌐 웹에서 후기·스토리까지 검색 (건당 약 $0.04 추가)', key='web_search', value=False)
 
     chat_input = st.chat_input(
         '영상·사진 첨부 또는 제품 설명을 입력하세요',
