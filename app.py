@@ -248,6 +248,46 @@ def run_analysis(gemini_files, prompt, use_search, result_container):
             return
 
 
+def generate_emphasis_proposals(data, emphasis):
+    client = get_gemini_client()
+    product_name = data.get('product_name', '')
+    features = ', '.join(data.get('features') or [])
+    selling_points = ', '.join(data.get('selling_points') or [])
+    target = data.get('target', '')
+    existing = '; '.join(
+        p.get('angle', '') for p in (data.get('content_proposals') or []) if isinstance(p, dict)
+    )
+    prompt = (
+        "너는 쇼핑 콘텐츠 대본 기획자다.\n\n"
+        f"제품 분석 결과:\n"
+        f"- 제품명: {product_name}\n"
+        f"- 특징: {features}\n"
+        f"- 소구점: {selling_points}\n"
+        f"- 타겟: {target}\n"
+        f"- 기존 제안 방향: {existing}\n\n"
+        f"사용자 강조 포인트(최우선·최고 중요도로 반영 필수): \"{emphasis}\"\n\n"
+        "위 강조 포인트를 가장 강하게 반영하고 기존 분석과 결합해서 "
+        "새로운 영상 대본 방향 2~3개를 제안해라.\n"
+        "반드시 JSON 배열만 출력. 마크다운 펜스 없이.\n"
+        "[{\"angle\":\"방향명\",\"idea\":\"구체적 영상 아이디어\",\"why\":\"강조 포인트를 어떻게 활용했는지\"}]\n\n"
+        + _KO_RULES
+    )
+    try:
+        chat = client.chats.create(model=GEMINI_MODEL)
+        config = genai_types.GenerateContentConfig(
+            thinking_config=genai_types.ThinkingConfig(thinking_budget=0)
+        )
+        resp = chat.send_message(prompt, config=config)
+        raw = re.sub(r'^```(?:json)?\s*', '', resp.text.strip(), flags=re.MULTILINE)
+        raw = re.sub(r'```\s*$', '', raw, flags=re.MULTILINE).strip()
+        result = json.loads(raw)
+        if isinstance(result, list):
+            return [p for p in result if isinstance(p, dict)]
+    except Exception:
+        pass
+    return []
+
+
 def _site_name(title):
     for sep in (' - ', ' | ', ' › ', ': ', ' : '):
         if sep in title:
@@ -272,7 +312,7 @@ def _web_items_html(items, use_search, grounded_lookup=None):
     return '\n'.join(lines)
 
 
-def build_report_html(data, grounded, use_search, source_type):
+def build_report_html(data, grounded, use_search, source_type, emphasis_proposals=None):
     product_name = data.get('product_name', '분석 결과')
     features = data.get('features') or []
     selling_points = data.get('selling_points') or []
@@ -326,6 +366,26 @@ def build_report_html(data, grounded, use_search, source_type):
   <div class="proposals-grid">{proposals_html}</div>
 </div>'''
 
+    emphasis_html = ''
+    for p in (emphasis_proposals or []):
+        if not isinstance(p, dict):
+            continue
+        angle = p.get('angle', '')
+        idea = p.get('idea', '')
+        why = p.get('why', '')
+        emphasis_html += f'''<div class="proposal-card">
+  <span class="angle-badge">{angle}</span>
+  <p class="idea">{idea}</p>
+  <p class="why">{why}</p>
+</div>'''
+
+    emphasis_section = ''
+    if emphasis_html:
+        emphasis_section = f'''<div class="section s-emphasis">
+  <h2 class="sec-title">✨ 강조 반영 대본 방향</h2>
+  <div class="proposals-grid">{emphasis_html}</div>
+</div>'''
+
     return f'''<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -345,6 +405,10 @@ body{{background:#f1f5f9;font-family:"Apple SD Gothic Neo","Malgun Gothic","Noto
 .s-target .sec-title{{color:#475569}}
 .s-web .sec-title{{color:#b45309}}
 .s-proposals .sec-title{{color:#6d28d9}}
+.s-emphasis .sec-title{{color:#0f766e}}
+.s-emphasis .proposal-card{{background:#f0fdfa;border:2px solid #0d9488}}
+.s-emphasis .angle-badge{{background:#0f766e}}
+.s-emphasis .why{{color:#0f766e}}
 .item-list{{list-style:none;display:flex;flex-direction:column;gap:8px}}
 .item-list li{{padding:10px 14px;border-radius:8px;font-size:14px;line-height:1.65}}
 .s-features .item-list li{{background:#eff6ff}}
@@ -377,6 +441,7 @@ body{{background:#f1f5f9;font-family:"Apple SD Gothic Neo","Malgun Gothic","Noto
   {card_section(rev_html, '실제 사용자 후기', '💬', 's-web')}
   {card_section(bs_html, '브랜드 스토리', '📖', 's-web')}
   {proposals_section}
+  {emphasis_section}
 </div>
 </body>
 </html>'''
@@ -387,6 +452,7 @@ def render_report():
     grounded = st.session_state.get('report_grounded', [])
     use_search = st.session_state.get('report_use_search', False)
     source_type = st.session_state.get('report_source_type', '분석')
+    emphasis_proposals = st.session_state.get('report_emphasis', [])
 
     _, btn_col, _ = st.columns([2, 3, 2])
     with btn_col:
@@ -397,6 +463,7 @@ def render_report():
                 st.session_state.messages = [{'role': 'assistant', 'content': WELCOME_MSG}]
                 st.session_state.report_data = None
                 st.session_state.report_grounded = []
+                st.session_state.report_emphasis = []
                 st.rerun()
         with c2:
             st.button('📝 대본 생성 →', disabled=True, use_container_width=True,
@@ -404,7 +471,25 @@ def render_report():
 
     if st.session_state.get('last_saved'):
         st.caption(f'💾 분석 기록 저장됨: {st.session_state.last_saved}')
-    st.html(build_report_html(data, grounded, use_search, source_type))
+    st.html(build_report_html(data, grounded, use_search, source_type, emphasis_proposals))
+
+    _, form_col, _ = st.columns([1, 2, 1])
+    with form_col:
+        with st.form('emphasis_form', clear_on_submit=True):
+            emphasis = st.text_area(
+                '강조하고 싶은 소구점·타겟·메시지를 입력하세요',
+                placeholder='예: 1인 가구 자취생 타겟 강조, 가성비 소구점 부각',
+                height=100,
+            )
+            submitted = st.form_submit_button('✨ 제안대본 추가하기', use_container_width=True, type='primary')
+        if submitted and emphasis.strip():
+            with st.spinner('강조 내용 반영해서 새 대본 방향 생성 중...'):
+                new_props = generate_emphasis_proposals(data, emphasis.strip())
+            if new_props:
+                st.session_state.report_emphasis.extend(new_props)
+                st.rerun()
+            else:
+                st.error('생성에 실패했습니다. 다시 시도해주세요.')
 
 
 def render_chat():
@@ -548,6 +633,7 @@ def render_chat():
         st.session_state.report_grounded = grounded
         st.session_state.report_use_search = use_search
         st.session_state.report_source_type = source_type
+        st.session_state.report_emphasis = []
         st.session_state.step = 'report'
         st.rerun()
     else:
@@ -567,6 +653,7 @@ def main():
         ('report_grounded', []),
         ('report_use_search', False),
         ('report_source_type', ''),
+        ('report_emphasis', []),
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
