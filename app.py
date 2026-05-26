@@ -248,14 +248,26 @@ def run_analysis(gemini_files, prompt, use_search, result_container):
             return
 
 
-def _web_items_html(items, use_search):
+def _site_name(title):
+    for sep in (' - ', ' | ', ' › ', ': ', ' : '):
+        if sep in title:
+            return title.split(sep)[0].strip()[:20]
+    return title[:20]
+
+
+def _web_items_html(items, use_search, grounded_lookup=None):
     lines = []
     for item in items:
         text = item.get('text', '')
         src = item.get('source', '')
         chip = ''
-        if use_search and _is_linkable(src):
-            chip = f' <a href="{src}" target="_blank" class="source-chip">{domain_label(src)} ↗</a>'
+        if use_search and isinstance(src, str) and src.startswith('http'):
+            if _is_linkable(src):
+                lbl = domain_label(src)
+            else:
+                title = (grounded_lookup or {}).get(src, '')
+                lbl = _site_name(title) if title else '출처'
+            chip = f' <a href="{src}" target="_blank" class="source-chip">{lbl} ↗</a>'
         lines.append(f'<li>{text}{chip}</li>')
     return '\n'.join(lines)
 
@@ -271,6 +283,8 @@ def build_report_html(data, grounded, use_search, source_type):
     reviews = validate_web_items(data.get('reviews', [])) if use_search else []
     brand_story = validate_web_items(data.get('brand_story', [])) if use_search else []
 
+    grounded_lookup = {g['uri']: g['title'] for g in (grounded or []) if g.get('uri')}
+
     date_str = datetime.now().strftime('%Y.%m.%d')
     search_badge = '<span class="badge-search">🌐 웹 검색 포함</span>' if use_search else ''
 
@@ -284,9 +298,9 @@ def build_report_html(data, grounded, use_search, source_type):
 
     features_html = ''.join(f'<li>{f}</li>' for f in features)
     sp_html = ''.join(f'<li>{sp}</li>' for sp in selling_points)
-    dev_html = _web_items_html(dev_intent, use_search)
-    rev_html = _web_items_html(reviews, use_search)
-    bs_html = _web_items_html(brand_story, use_search)
+    dev_html = _web_items_html(dev_intent, use_search, grounded_lookup)
+    rev_html = _web_items_html(reviews, use_search, grounded_lookup)
+    bs_html = _web_items_html(brand_story, use_search, grounded_lookup)
 
     target_section = ''
     if target:
