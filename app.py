@@ -173,6 +173,8 @@ def save_result(payload):
     return os.path.relpath(path, BASE)
 
 
+_BLOCKED_DOMAINS = ('vertexaisearch.cloud.google.com',)
+
 def validate_web_items(items):
     result = []
     for item in (items or []):
@@ -180,7 +182,8 @@ def validate_web_items(items):
             continue
         src = item.get('source', '')
         if isinstance(src, str) and src.startswith('http'):
-            result.append(item)
+            if not any(d in src for d in _BLOCKED_DOMAINS):
+                result.append(item)
     return result
 
 
@@ -305,18 +308,6 @@ def build_report_html(data, grounded, use_search, source_type):
   <div class="proposals-grid">{proposals_html}</div>
 </div>'''
 
-    sources_footer = ''
-    if use_search and grounded:
-        links = ''
-        for g in grounded[:10]:
-            uri = g.get('uri', '')
-            title = g.get('title', '') or domain_label(uri)
-            if uri:
-                label = title[:50] if title else domain_label(uri)
-                links += f'<a href="{uri}" target="_blank" class="footer-src">{label}</a>'
-        if links:
-            sources_footer = f'<div class="footer-section"><p class="footer-label">참고 출처</p><div class="footer-links">{links}</div></div>'
-
     return f'''<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -349,11 +340,6 @@ body{{background:#f1f5f9;font-family:"Apple SD Gothic Neo","Malgun Gothic","Noto
 .angle-badge{{display:inline-block;background:#6d28d9;color:white;font-size:11px;font-weight:700;padding:3px 10px;border-radius:20px;margin-bottom:10px}}
 .idea{{font-size:14px;font-weight:600;color:#1e293b;margin-bottom:7px;line-height:1.55}}
 .why{{font-size:12px;color:#7c3aed;line-height:1.55}}
-.footer-section{{margin-top:8px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:16px 20px}}
-.footer-label{{font-size:11px;color:#94a3b8;font-weight:700;text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px}}
-.footer-links{{display:flex;flex-wrap:wrap;gap:8px}}
-.footer-src{{font-size:12px;color:#64748b;text-decoration:none;padding:4px 10px;background:white;border:1px solid #e2e8f0;border-radius:6px}}
-.footer-src:hover{{border-color:#94a3b8;color:#1e293b}}
 </style>
 </head>
 <body>
@@ -373,7 +359,6 @@ body{{background:#f1f5f9;font-family:"Apple SD Gothic Neo","Malgun Gothic","Noto
   {card_section(rev_html, '실제 사용자 후기', '💬', 's-web')}
   {card_section(bs_html, '브랜드 스토리', '📖', 's-web')}
   {proposals_section}
-  {sources_footer}
 </div>
 </body>
 </html>'''
