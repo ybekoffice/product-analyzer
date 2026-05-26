@@ -58,9 +58,9 @@ PROMPT_FILE_ON = (
     "첨부된 파일(영상/사진)을 분석하고 웹 검색으로 추가 정보를 찾아서 아래 JSON 형식으로만 출력해줘. 반드시 JSON만, 마크다운 펜스 없이.{product_line}\n"
     "배경/부가 제품 무시, 주요 제품 집중.\n\n"
     "웹 섹션(dev_intent·reviews·brand_story) 규칙:\n"
-    "- 웹 검색으로 실제 확인된 내용만 포함. 각 항목에 실제 출처 URL 필수.\n"
-    "- source 필드는 반드시 실제 웹사이트 URL 사용 (예: https://naver.com/..., https://taobao.com/...). vertexaisearch.cloud.google.com 등 Google 내부 URL 절대 사용 금지.\n"
-    "- 출처 확인 불가 시 그 항목 완전 제외. 추측·일반론 금지.\n"
+    "- 웹 검색으로 실제 확인된 내용만 포함. 추측·일반론 금지.\n"
+    "- 각 항목 source 필드에 검색 결과 출처 URL을 그대로 넣어라. URL 형식 때문에 항목을 빼지 말 것.\n"
+    "- 내용 자체를 찾지 못한 섹션만 빈 배열 [].\n"
     "content_proposals는 소구점·스토리 활용 영상 방향 3가지 (출처 불필요).\n\n"
     + _KO_RULES
     + _JSON_SHAPE
@@ -82,7 +82,7 @@ PROMPT_TEXT_ON = (
     "특정 제품을 설명하면 → 분석 + 웹 검색 후 아래 JSON 출력.\n"
     "아니면 → 텍스트로 2~3문장 친근하게 응대.\n\n"
     "JSON 출력 시: 마크다운 펜스 없이.\n"
-    "웹 섹션: 확인된 내용 + source URL 필수. source는 실제 웹사이트 URL만 (vertexaisearch.cloud.google.com 등 Google 내부 URL 금지). 확인 불가 시 항목 제외. content_proposals 3가지.\n\n"
+    "웹 섹션: 실제 확인된 내용만(추측·일반론 금지). source 필드에 검색 출처 URL 그대로 기입. URL 형식 때문에 항목 제외 금지. 내용 못 찾은 섹션만 []. content_proposals 3가지.\n\n"
     + _KO_RULES
     + _JSON_SHAPE
 )
@@ -295,7 +295,7 @@ def _site_name(title):
     return title[:20]
 
 
-def _web_items_html(items, use_search, grounded_lookup=None):
+def _web_items_html(items, use_search, grounded_lookup=None, fallback_site=''):
     lines = []
     for item in items:
         text = item.get('text', '')
@@ -306,7 +306,12 @@ def _web_items_html(items, use_search, grounded_lookup=None):
                 lbl = domain_label(src)
             else:
                 title = (grounded_lookup or {}).get(src, '')
-                lbl = _site_name(title) if title else '출처'
+                if title:
+                    lbl = _site_name(title)
+                elif fallback_site:
+                    lbl = fallback_site
+                else:
+                    lbl = '출처'
             chip = f' <a href="{src}" target="_blank" class="source-chip">{lbl} ↗</a>'
         lines.append(f'<li>{text}{chip}</li>')
     return '\n'.join(lines)
@@ -324,6 +329,8 @@ def build_report_html(data, grounded, use_search, source_type, emphasis_proposal
     brand_story = validate_web_items(data.get('brand_story', [])) if use_search else []
 
     grounded_lookup = {g['uri']: g['title'] for g in (grounded or []) if g.get('uri')}
+    site_names = {_site_name(g['title']) for g in (grounded or []) if g.get('title')}
+    fallback_site = next(iter(site_names)) if len(site_names) == 1 else ''
 
     date_str = datetime.now().strftime('%Y.%m.%d')
     search_badge = '<span class="badge-search">🌐 웹 검색 포함</span>' if use_search else ''
@@ -338,9 +345,9 @@ def build_report_html(data, grounded, use_search, source_type, emphasis_proposal
 
     features_html = ''.join(f'<li>{f}</li>' for f in features)
     sp_html = ''.join(f'<li>{sp}</li>' for sp in selling_points)
-    dev_html = _web_items_html(dev_intent, use_search, grounded_lookup)
-    rev_html = _web_items_html(reviews, use_search, grounded_lookup)
-    bs_html = _web_items_html(brand_story, use_search, grounded_lookup)
+    dev_html = _web_items_html(dev_intent, use_search, grounded_lookup, fallback_site)
+    rev_html = _web_items_html(reviews, use_search, grounded_lookup, fallback_site)
+    bs_html = _web_items_html(brand_story, use_search, grounded_lookup, fallback_site)
 
     target_section = ''
     if target:
