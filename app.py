@@ -16,12 +16,32 @@ from PIL import Image
 import io
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-MAIN_PROCESS_DIR = os.path.abspath(os.path.join(BASE, '..'))  # 대본 추천 엔진 위치
+MAIN_PROCESS_DIR = os.path.abspath(os.path.join(BASE, '..'))  # 대본 추천 엔진 위치 (로컬 개발)
 # harness 공통 .env: 현재 위치는 main process/product-analyzer 이므로 3단계 위가 harness 루트.
 # (예전 projects/product-analyzer 시절엔 2단계였음 — 폴더 이동 시 이 깊이 함께 조정)
 # override=True: 셸(~/.zshrc)에 박힌 낡은 ANTHROPIC_API_KEY가 .env를 가리지 않도록 강제 덮어쓰기.
 load_dotenv(os.path.join(BASE, '..', '..', '..', '.env'), override=True)
 load_dotenv(os.path.join(BASE, '.env'), override=True)
+
+# 의존 코드 경로 부트스트랩 (로컬/클라우드 양쪽 동작) ---------------------------
+# 로컬: ../recommend_engine.py + ../../.. (harness)/shared/* 사용 — 단일 소스
+# 클라우드: 저장소가 product-analyzer 폴더 하나뿐이라 위 경로가 없음 → scripts/build_deploy_bundle.py
+# 가 미리 만들어 둔 _bundle/ 에서 recommend_engine·shared·prompts 를 끌어다 쓴다.
+# 판별 기준: ../recommend_engine.py 존재 여부 (로컬 layout 시그니처).
+_DEPLOY_BUNDLE = os.path.join(BASE, '_bundle')
+if os.path.exists(os.path.join(MAIN_PROCESS_DIR, 'recommend_engine.py')):
+    # 로컬: harness 루트 + main process 폴더를 sys.path 에 올린다. (recommend_engine 도 같은 방식으로
+    # 자기 옆 prompts/ 미존재 시 HARNESS/prompts 로 폴백.)
+    sys.path.insert(0, os.path.abspath(os.path.join(BASE, '..', '..', '..')))  # harness root
+    sys.path.insert(0, MAIN_PROCESS_DIR)
+elif os.path.exists(os.path.join(_DEPLOY_BUNDLE, 'recommend_engine.py')):
+    # 클라우드(번들): _bundle/ 을 harness 루트처럼 sys.path 첫 자리에 → from shared.X / import recommend_engine 둘 다 동작.
+    sys.path.insert(0, _DEPLOY_BUNDLE)
+else:
+    raise RuntimeError(
+        "recommend_engine.py를 찾을 수 없습니다 — 로컬이라면 main process/ 폴더 구조를, "
+        "Streamlit Cloud라면 product-analyzer/_bundle/ 존재(scripts/build_deploy_bundle.py 실행)를 확인하세요."
+    )
 
 GEMINI_MODEL = "gemini-2.5-flash"
 # 2.5-flash가 과부하(503/overload)일 때 자동으로 갈아탈 폴백 모델 (2.0-flash는 폐기됨)
@@ -692,8 +712,12 @@ def get_anthropic_client():
     return anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
 
 
-def run_recommendation(data, n=5):
-    """소구점 분석 결과 → 어울리는 원본 대본 추천 (main_test.db 엔진 호출)."""
+def run_recommendation(data, n=5, emphasis=""):
+    """소구점 분석 결과 → 어울리는 원본 대본 추천 (main_test.db 엔진 호출).
+
+    emphasis(사용자 최우선 강조)가 있으면 원본 선택 랭킹에 최우선으로 얹는다.
+    비어 있으면 기존 추천과 동일하게 동작한다.
+    """
     if MAIN_PROCESS_DIR not in sys.path:
         sys.path.insert(0, MAIN_PROCESS_DIR)
     import recommend_engine
@@ -701,11 +725,27 @@ def run_recommendation(data, n=5):
     return recommend_engine.recommend(
         product_name=data.get('product_name', ''),
         selling_points=data.get('selling_points') or [],
-        n=n, client=client,
+        n=n, client=client, emphasis=emphasis,
     )
 
 
-def render_recommendations(recos, meta):
+def render_match(r):
+    """추천 카드에 소구점 일치율(0~100%)과 일치 이유를 표시한다.
+
+    match_score는 Haiku 의미 판단 점수(어휘 보충 건은 difflib %),
+    match_reason은 '무엇이 겹쳐서 일치하는지' 한 줄. 점수가 없으면(폴백) 건너뛴다.
+    """
+    score = r.get('match_score')
+    reason = (r.get('match_reason') or '').strip()
+    if score is not None:
+        s = min(max(int(score), 0), 100)
+        st.markdown(f"🎯 **소구점 일치율: {s}%**")
+        st.progress(s / 100)
+    if reason:
+        st.caption(f"📝 일치 이유: {reason}")
+
+
+def render_recommendations(recos, meta, data, models=None):
     st.divider()
     if meta.get('error'):
         st.error(f"대본 추천 중 오류가 발생했습니다: {meta['error']}")
@@ -725,9 +765,11 @@ def render_recommendations(recos, meta):
         with st.container(border=True):
             st.markdown(f"**{r['rank']}위**  ·  참고 분류: {r['coupang_mid']} / {r['product_type']}")
             st.markdown(f"💡 **이 대본의 소구점**: {r['selling_point']}")
+            render_match(r)
             with st.expander("원본 대본 전문 보기"):
                 st.write(r['transcript'] or '(대본 없음)')
             st.caption(f"media_id: {r['media_id']}")
+            render_regenerate(r, data, 'basic', models=models)
 
 
 # 훅 기법(devices) 태그 → 한글 라벨 (recommend_engine.DEVICE_ORDER와 같은 키)
@@ -758,7 +800,7 @@ def run_recommendation_by_device(data, per_type=2):
     )
 
 
-def render_recommendations_by_device(groups, meta):
+def render_recommendations_by_device(groups, meta, data, models=None):
     st.divider()
     if meta.get('error'):
         st.error(f"유형별 추천 중 오류가 발생했습니다: {meta['error']}")
@@ -772,21 +814,172 @@ def render_recommendations_by_device(groups, meta):
         f" · 후보 풀 {meta.get('pool_total', 0):,}개 중 추천"
         f" · 중복 제거 {meta.get('n_dropped_dup', 0)}건"
     )
+    st.caption(
+        f"💰 이번 추천 비용 **${meta.get('total_cost', 0.0):.4f}**"
+        f" (랭킹 ${meta.get('rank_cost', 0.0):.4f} + 카테고리 분류 ${meta.get('classify_cost', 0.0):.4f})"
+    )
     if not groups:
         st.info("어울리는 대본을 찾지 못했습니다. 소구점을 더 구체적으로 입력하면 결과가 좋아집니다.")
         return
-    for g in groups:
-        device = g['device']
-        label = DEVICE_LABELS.get(device, device)
-        st.markdown(f"##### 🏷️ {label}  `{device}`")
-        for r in g['items']:
-            with st.container(border=True):
-                st.markdown(f"**{r['rank']}위**  ·  참고 분류: {r['coupang_mid']} / {r['product_type']}")
-                st.markdown(f"💡 **이 대본의 소구점**: {r['selling_point']}")
-                st.caption(f"훅 기법 태그: {r['devices']}")
-                with st.expander("원본 대본 전문 보기"):
-                    st.write(r['transcript'] or '(대본 없음)')
-                st.caption(f"media_id: {r['media_id']}")
+    # 훅 유형별 탭 — 탭 라벨은 한글 라벨 + 개수. groups는 DEVICE_ORDER 순.
+    tab_labels = [f"{DEVICE_LABELS.get(g['device'], g['device'])} ({len(g['items'])})" for g in groups]
+    for tab, g in zip(st.tabs(tab_labels), groups):
+        with tab:
+            st.caption(f"훅 기법: {DEVICE_LABELS.get(g['device'], g['device'])}  ·  `{g['device']}`")
+            for r in g['items']:
+                with st.container(border=True):
+                    st.markdown(f"**{r['rank']}위**  ·  참고 분류: {r['coupang_mid']} / {r['product_type']}")
+                    st.markdown(f"💡 **이 대본의 소구점**: {r['selling_point']}")
+                    render_match(r)
+                    st.caption(f"훅 기법 태그: {r['devices']}")
+                    with st.expander("원본 대본 전문 보기"):
+                        st.write(r['transcript'] or '(대본 없음)')
+                    st.caption(f"media_id: {r['media_id']}")
+                    render_regenerate(r, data, 'device', models=models)
+
+
+# 재작성에 쓸 모델 개수. 지금은 항상 3개(하이쿠·소넷·오푸스 전체 비교).
+# 추후 1·2·3개 선택 UI를 붙이려면 이 값을 사용자 선택으로 바꾸면 된다
+# (오케스트레이션은 shared.regenerate_models가 1·2·3개를 모두 지원).
+REGEN_N = 3
+
+
+def _regen_inputs(data):
+    """data → (topic, selling_point) 재작성 입력 구성."""
+    topic = (data.get('product_name') or '').strip() or '입력한 제품'
+    sps = [s for s in (data.get('selling_points') or []) if s and s.strip()]
+    return topic, ' / '.join(sps)
+
+
+def run_regenerate_compare(data, original_script, n=REGEN_N, models=None, emphasis=""):
+    """추천 원본을 n개(또는 지정한) 모델로 각각 재작성 → 결과·비용 비교.
+
+    오케스트레이션·병렬·집계는 shared.regenerate_models가 담당(중복 구현 없음).
+    원본의 화법·호흡·구조(느낌)는 보존하고 내용만 입력 제품/소구점으로 교체한다.
+    반환: {'results': [{key,label,tier,model,script,cost} | {...,error}], 'total_cost': float, 'models': [...]}
+    """
+    harness_dir = os.path.abspath(os.path.join(MAIN_PROCESS_DIR, '..', '..'))
+    if harness_dir not in sys.path:
+        sys.path.insert(0, harness_dir)
+    from shared.regenerate_models import regenerate_models
+    client = get_anthropic_client()
+    topic, selling_point = _regen_inputs(data)
+    return regenerate_models(original_script, topic, selling_point,
+                             models=models, n=n, client=client, emphasis=emphasis)
+
+
+def render_regenerate(r, data, key_prefix, models=None):
+    """추천 카드 1개에 '재작성(모델 비교)' 버튼 + 모델별 결과·비용 나란히 표시.
+
+    key_prefix로 일반 추천('basic')·유형별 추천('device')의 버튼/상태 키를 분리한다
+    (같은 media_id가 두 영역에 동시에 떠도 충돌하지 않도록).
+    models=None이면 기존 동작(3개 전체), 리스트를 주면 그 모델들로만 재작성한다.
+    빈 리스트(모델 0개 선택)면 버튼을 비활성화한다.
+    """
+    original = (r.get('transcript') or '').strip()
+    if not original:
+        st.caption('⚠️ 원본 대본이 없어 재작성할 수 없습니다.')
+        return
+    n_models = len(models) if models else REGEN_N
+    state_key = f"regen_{key_prefix}_{r['media_id']}"
+    if st.button(f'🆕 이 대본으로 재작성 — {n_models}개 모델 비교', key=f"btn_{state_key}",
+                 use_container_width=True, disabled=(models is not None and not models)):
+        with st.spinner(f'{n_models}개 모델로 각각 재작성 중...'):
+            try:
+                emphasis = st.session_state.get('emphasis_active', '')
+                st.session_state[state_key] = run_regenerate_compare(
+                    data, original, models=models, emphasis=emphasis)
+            except Exception as ex:
+                st.session_state[state_key] = {'error': str(ex)}
+        st.rerun()
+    res = st.session_state.get(state_key)
+    if res:
+        _render_regen_result(res)
+
+
+def _render_regen_result(res):
+    """재작성 결과(dict) → 모델별 컬럼 + 합계 비용. dev 카드·deploy 공통 렌더(중복 제거)."""
+    if res.get('error'):
+        st.error(f"재작성 중 오류가 발생했습니다: {res['error']}")
+        return
+    results = res['results']
+    st.markdown('🆕 **모델별 재작성 결과 비교**')
+    cols = st.columns(len(results))
+    for col, mr in zip(cols, results):
+        with col:
+            st.markdown(f"**{mr['label']}** · {mr['tier']}")
+            if mr.get('error'):
+                st.error(mr['error'])
+            elif mr.get('script'):
+                st.write(mr['script'])
+                st.caption(f"비용 ${mr['cost']:.5f}")
+            else:
+                st.caption('(결과 없음)')
+    st.caption(f"합계 비용 ${res['total_cost']:.5f} · {len(results)}개 모델 동시 재작성")
+
+
+def get_mode():
+    """URL ?mode=dev → 'dev', 그 외/없음 → 'deploy'(기본).
+
+    http://localhost:8510         = 배포용(기본, 대본추천 숨김)
+    http://localhost:8510/?mode=dev = 개발용(추천 단계 노출)
+    """
+    return 'dev' if st.query_params.get('mode') == 'dev' else 'deploy'
+
+
+# 재작성 모델 선택지 (key, 한글 라벨). shared.regenerate_models가 key 리스트를 받는다.
+MODEL_CHOICES = [('haiku', '하이쿠 4.5'), ('sonnet', '소넷 4.6'), ('opus', '오푸스 4.7')]
+
+
+def render_model_selector():
+    """재작성에 쓸 모델 선택(전역, 두 모드 공통). 기본 = 3개 전체. 빈 선택은 호출부에서 막는다."""
+    keys = [k for k, _ in MODEL_CHOICES]
+    labels = dict(MODEL_CHOICES)
+    return st.multiselect('재작성에 사용할 모델', options=keys, default=keys,
+                          format_func=lambda k: labels[k], key='regen_models')
+
+
+DEPLOY_TOPN = 3   # 배포용에서 내부 선택할 원본 개수(일단 3)
+
+
+def render_deploy_regenerate(data, models=None):
+    """배포용 모드: 추천 UI 없이 내부에서 원본 top-3을 뽑아 각각 재작성 → 대본안 3개.
+
+    대본추천 과정(소구점/분류/media_id)은 화면에 노출하지 않고, recommend()의 상위
+    원본 transcript만 가져와 선택 모델로 재작성한 결과만 보여준다. 버튼 클릭 시 실행.
+    """
+    state_key = 'regen_deploy'   # {'items':[result,...]} 또는 {'error':...}
+    emphasis = st.session_state.get('emphasis_active', '')
+    if st.button('✨ 내 제품 대본 만들기', use_container_width=True, type='primary',
+                 key='btn_regen_deploy', disabled=not models):
+        with st.spinner('선택한 모델로 대본 생성 중...'):
+            try:
+                recos, _ = run_recommendation(data, n=DEPLOY_TOPN, emphasis=emphasis)   # 추천 UI는 렌더 안 함
+                originals = [(r.get('transcript') or '').strip() for r in (recos or [])]
+                originals = [o for o in originals if o][:DEPLOY_TOPN]
+                if not originals:
+                    st.session_state[state_key] = {
+                        'error': '어울리는 원본 대본을 찾지 못했습니다. 소구점을 더 구체적으로 입력해보세요.'}
+                else:
+                    st.session_state[state_key] = {
+                        'items': [run_regenerate_compare(data, o, models=models, emphasis=emphasis)
+                                  for o in originals]}
+            except Exception as ex:
+                st.session_state[state_key] = {'error': str(ex)}
+        st.rerun()
+    if not models:
+        st.caption('모델을 한 개 이상 선택하세요.')
+    res = st.session_state.get(state_key)
+    if not res:
+        return
+    if res.get('error'):
+        st.error(res['error'])
+        return
+    items = res.get('items', [])
+    for i, item in enumerate(items, 1):
+        st.markdown(f"#### 대본안 {i}")
+        _render_regen_result(item)
+        st.divider()
 
 
 def render_report():
@@ -796,9 +989,14 @@ def render_report():
     source_type = st.session_state.get('report_source_type', '분석')
     emphasis_proposals = st.session_state.get('report_emphasis', [])
 
+    mode = get_mode()
     _, btn_col, _ = st.columns([1, 4, 1])
     with btn_col:
-        c1, c2, c3 = st.columns(3)
+        # 배포용은 '← 새 분석'만, 개발용은 추천 버튼 2개까지 노출
+        if mode == 'dev':
+            c1, c2, c3 = st.columns(3)
+        else:
+            (c1,) = st.columns(1)
         with c1:
             if st.button('← 새 분석', use_container_width=True):
                 st.session_state.step = 'chat'
@@ -806,62 +1004,86 @@ def render_report():
                 st.session_state.report_data = None
                 st.session_state.report_grounded = []
                 st.session_state.report_emphasis = []
+                st.session_state.emphasis_active = ''
                 st.session_state.recommendations = None
                 st.session_state.reco_meta = {}
                 st.session_state.device_recommendations = None
                 st.session_state.device_reco_meta = {}
+                for k in [k for k in st.session_state.keys() if k.startswith('regen_')]:
+                    del st.session_state[k]
                 st.rerun()
-        with c2:
-            if st.button('📝 어울리는 대본 추천', use_container_width=True, type='primary'):
-                with st.spinner('소구점에 어울리는 원본 대본을 찾는 중...'):
-                    try:
-                        recos, meta = run_recommendation(data)
-                        st.session_state.recommendations = recos
-                        st.session_state.reco_meta = meta
-                    except Exception as ex:
-                        st.session_state.recommendations = []
-                        st.session_state.reco_meta = {'error': str(ex)}
-                st.rerun()
-        with c3:
-            if st.button('🎭 유형별 추천', use_container_width=True):
-                with st.spinner('훅 기법 유형별로 어울리는 원본 대본을 찾는 중...'):
-                    try:
-                        groups, meta = run_recommendation_by_device(data)
-                        st.session_state.device_recommendations = groups
-                        st.session_state.device_reco_meta = meta
-                    except Exception as ex:
-                        st.session_state.device_recommendations = []
-                        st.session_state.device_reco_meta = {'error': str(ex)}
-                st.rerun()
+        if mode == 'dev':
+            with c2:
+                if st.button('📝 어울리는 대본 추천', use_container_width=True, type='primary'):
+                    with st.spinner('소구점에 어울리는 원본 대본을 찾는 중...'):
+                        try:
+                            recos, meta = run_recommendation(
+                                data, emphasis=st.session_state.get('emphasis_active', ''))
+                            st.session_state.recommendations = recos
+                            st.session_state.reco_meta = meta
+                        except Exception as ex:
+                            st.session_state.recommendations = []
+                            st.session_state.reco_meta = {'error': str(ex)}
+                    st.rerun()
+            with c3:
+                if st.button('🎭 유형별 추천', use_container_width=True):
+                    with st.spinner('훅 기법 유형별로 어울리는 원본 대본을 찾는 중...'):
+                        try:
+                            groups, meta = run_recommendation_by_device(data)
+                            st.session_state.device_recommendations = groups
+                            st.session_state.device_reco_meta = meta
+                        except Exception as ex:
+                            st.session_state.device_recommendations = []
+                            st.session_state.device_reco_meta = {'error': str(ex)}
+                    st.rerun()
 
     if st.session_state.get('last_saved'):
         st.caption(f'💾 분석 기록 저장됨: {st.session_state.last_saved}')
     st.html(build_report_html(data, grounded, use_search, source_type, emphasis_proposals))
 
-    if st.session_state.get('recommendations') is not None:
-        render_recommendations(st.session_state.recommendations, st.session_state.get('reco_meta', {}))
-
-    if st.session_state.get('device_recommendations') is not None:
-        render_recommendations_by_device(
-            st.session_state.device_recommendations, st.session_state.get('device_reco_meta', {}))
-
+    # ① 대본 아이디어 추가 (강조 입력) — 최상단.
+    #    입력 내용은 '최우선 강조'로 저장되어, 아래 대본 생성하기(원본 선택 + 재작성)에
+    #    가장 강하게 반영된다. (입력 없으면 기존 추천/재작성 동작 그대로)
     _, form_col, _ = st.columns([1, 2, 1])
     with form_col:
+        active = st.session_state.get('emphasis_active', '')
+        if active:
+            ac1, ac2 = st.columns([5, 1])
+            ac1.success(f'💪 현재 강조 반영 중: {active}')
+            if ac2.button('해제', key='clear_emphasis', use_container_width=True):
+                st.session_state.emphasis_active = ''
+                st.rerun()
         with st.form('emphasis_form', clear_on_submit=True):
             emphasis = st.text_area(
                 '강조하고 싶은 소구점·타겟·메시지를 입력하세요',
                 placeholder='예: 1인 가구 자취생 타겟 강조, 가성비 소구점 부각',
                 height=100,
             )
-            submitted = st.form_submit_button('✨ 제안대본 추가하기', use_container_width=True, type='primary')
+            submitted = st.form_submit_button('✨ 대본 아이디어 추가', use_container_width=True, type='primary')
         if submitted and emphasis.strip():
-            with st.spinner('강조 내용 반영해서 새 대본 방향 생성 중...'):
-                new_props = generate_emphasis_proposals(data, emphasis.strip())
-            if new_props:
-                st.session_state.report_emphasis.extend(new_props)
-                st.rerun()
-            else:
-                st.error('생성에 실패했습니다. 다시 시도해주세요.')
+            st.session_state.emphasis_active = emphasis.strip()   # 생성에 최우선 반영될 강조
+            # 대본방향 제안 추가 생성은 비활성화(속도 우선). 강조는 추천·재작성에 그대로 반영됨.
+            # 재활성화하려면 generate_emphasis_proposals(data, emphasis.strip()) 호출 복구.
+            st.rerun()
+
+    # ② 재작성 모델 선택기 (두 모드 공통, 1회)
+    _, sel_col, _ = st.columns([1, 2, 1])
+    with sel_col:
+        selected = render_model_selector()
+
+    # ③ 대본 생성하기 / 추천 (강조가 있으면 원본 선택·재작성 양쪽에 최우선 반영)
+    if mode == 'dev':
+        if st.session_state.get('recommendations') is not None:
+            render_recommendations(
+                st.session_state.recommendations, st.session_state.get('reco_meta', {}), data, models=selected)
+        if st.session_state.get('device_recommendations') is not None:
+            render_recommendations_by_device(
+                st.session_state.device_recommendations, st.session_state.get('device_reco_meta', {}), data,
+                models=selected)
+    else:
+        _, dep_col, _ = st.columns([1, 2, 1])
+        with dep_col:
+            render_deploy_regenerate(data, models=selected)
 
 
 def render_chat():
@@ -1037,6 +1259,7 @@ def main():
         ('report_use_search', False),
         ('report_source_type', ''),
         ('report_emphasis', []),
+        ('emphasis_active', ''),
         ('recommendations', None),
         ('reco_meta', {}),
         ('device_recommendations', None),

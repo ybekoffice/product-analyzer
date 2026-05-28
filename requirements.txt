@@ -3,3 +3,9 @@ google-genai>=1.5.0
 opencv-python-headless>=4.6.0
 Pillow>=9.0.0
 python-dotenv>=1.0.0
+# 추천 엔진 (recommend_engine) 의 Anthropic Claude 호출 — 소구점 랭킹/카테고리 분류/재작성
+anthropic>=0.40.0
+# Supabase 백엔드 (script_candidates) 연결. 환경에 SUPABASE_DB_URL 있을 때만 활성화
+psycopg2-binary>=2.9.0
+# 데이터 처리 (recommend_engine 의 후보 풀 조립)
+pandas>=2.0.0
